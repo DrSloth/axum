@@ -65,7 +65,11 @@
 
 use self::rejection::*;
 use super::{rejection::*, FromRequest, RequestParts};
-use crate::{response::IntoResponse, Error};
+use crate::{
+    body::{self, BoxBody},
+    response::IntoResponse,
+    Error,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{
@@ -76,7 +80,6 @@ use http::{
     header::{self, HeaderName, HeaderValue},
     Method, Response, StatusCode,
 };
-use http_body::Full;
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use sha1::{Digest, Sha1};
 use std::{
@@ -215,7 +218,7 @@ where
 
         let sec_websocket_key = if let Some(key) = req
             .headers_mut()
-            .ok_or(HeadersAlreadyExtracted)?
+            .ok_or_else(HeadersAlreadyExtracted::default)?
             .remove(header::SEC_WEBSOCKET_KEY)
         {
             key
@@ -225,13 +228,13 @@ where
 
         let on_upgrade = req
             .extensions_mut()
-            .ok_or(ExtensionsAlreadyExtracted)?
+            .ok_or_else(ExtensionsAlreadyExtracted::default)?
             .remove::<OnUpgrade>()
             .unwrap();
 
         let sec_websocket_protocol = req
             .headers()
-            .ok_or(HeadersAlreadyExtracted)?
+            .ok_or_else(HeadersAlreadyExtracted::default)?
             .get(header::SEC_WEBSOCKET_PROTOCOL)
             .cloned();
 
@@ -250,7 +253,11 @@ fn header_eq<B>(
     key: HeaderName,
     value: &'static str,
 ) -> Result<bool, HeadersAlreadyExtracted> {
-    if let Some(header) = req.headers().ok_or(HeadersAlreadyExtracted)?.get(&key) {
+    if let Some(header) = req
+        .headers()
+        .ok_or_else(HeadersAlreadyExtracted::default)?
+        .get(&key)
+    {
         Ok(header.as_bytes().eq_ignore_ascii_case(value.as_bytes()))
     } else {
         Ok(false)
@@ -262,7 +269,11 @@ fn header_contains<B>(
     key: HeaderName,
     value: &'static str,
 ) -> Result<bool, HeadersAlreadyExtracted> {
-    let header = if let Some(header) = req.headers().ok_or(HeadersAlreadyExtracted)?.get(&key) {
+    let header = if let Some(header) = req
+        .headers()
+        .ok_or_else(HeadersAlreadyExtracted::default)?
+        .get(&key)
+    {
         header
     } else {
         return Ok(false);
@@ -285,10 +296,7 @@ where
     F: FnOnce(WebSocket) -> Fut + Send + 'static,
     Fut: Future + Send + 'static,
 {
-    type Body = Full<Bytes>;
-    type BodyError = <Self::Body as http_body::Body>::Error;
-
-    fn into_response(self) -> Response<Self::Body> {
+    fn into_response(self) -> Response<BoxBody> {
         // check requested protocols
         let protocol = self
             .extractor
@@ -347,7 +355,7 @@ where
             builder = builder.header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
         }
 
-        builder.body(Full::default()).unwrap()
+        builder.body(body::boxed(body::Empty::new())).unwrap()
     }
 }
 

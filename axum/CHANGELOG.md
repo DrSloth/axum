@@ -7,7 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
-- None.
+- **breaking:** New `MethodRouter` that works similarly to `Router`:
+  - Route to handlers and services with the same type
+  - Add middleware to some routes more easily with `MethodRouter::layer` and
+    `MethodRouter::route_layer`.
+  - Merge method routers with `MethodRouter::merge`
+  - Customize response for unsupported methods with `MethodRouter::fallback`
+- **breaking:** The default for the type parameter in `FromRequest` and
+  `RequestParts` has been removed. Use `FromRequest<Body>` and
+  `RequestParts<Body>` to get the previous behavior ([#564])
+- **added:** `FromRequest` and `IntoResponse` are now defined in a new called
+  `axum-core`. This crate is intended for library authors to depend on, rather
+  than `axum` itself, if possible. `axum-core` has a smaller API and will thus
+  receive fewer breaking changes. `FromRequest` and `IntoResponse` are
+  re-exported from `axum` in the same location so nothing is changed for `axum`
+  users ([#564])
+- **breaking:** The previously deprecated `axum::body::box_body` function has
+  been removed. Use `axum::body::boxed` instead.
+- **fixed:** Adding the same route with different methods now works ie
+  `.route("/", get(_)).route("/", post(_))`.
+- **breaking:** `routing::handler_method_router` and
+  `routing::service_method_router` has been removed in favor of
+  `routing::{get, get_service, ..., MethodRouter}`.
+- **breaking:** `HandleErrorExt` has been removed in favor of
+  `MethodRouter::handle_error`.
+- **breaking:** `HandleErrorLayer` now requires the handler function to be
+  `async` ([#534])
+- **added:** `HandleErrorLayer` now supports running extractors.
+- **breaking:** The `Handler<B, T>` trait is now defined as `Handler<T, B =
+  Body>`. That is the type parameters have been swapped and `B` defaults to
+  `axum::body::Body` ([#527])
+- **breaking:** `Router::merge` will panic if both routers have fallbacks.
+  Previously the left side fallback would be silently discarded ([#529])
+- **breaking:** `Router::nest` will panic if the nested router has a fallback.
+  Previously it would be silently discarded ([#529])
+- Update WebSockets to use tokio-tungstenite 0.16 ([#525])
+- **added:** Default to return `charset=utf-8` for text content type. ([#554])
+- **breaking:** The `Body` and `BodyError` associated types on the
+  `IntoResponse` trait have been removed - instead, `.into_response()` will now
+  always return `Response<BoxBody>` ([#571])
+- **breaking:** `PathParamsRejection` has been renamed to `PathRejection` and its
+  variants renamed to `FailedToDeserializePathParams` and `MissingPathParams`. This
+  makes it more consistent with the rest of axum ([#574])
+- **added:** `Path`'s rejection type now provides data about exactly which part of
+  the path couldn't be deserialized ([#574])
+
+[#525]: https://github.com/tokio-rs/axum/pull/525
+[#527]: https://github.com/tokio-rs/axum/pull/527
+[#529]: https://github.com/tokio-rs/axum/pull/529
+[#534]: https://github.com/tokio-rs/axum/pull/534
+[#554]: https://github.com/tokio-rs/axum/pull/554
+[#564]: https://github.com/tokio-rs/axum/pull/564
+[#571]: https://github.com/tokio-rs/axum/pull/571
+[#574]: https://github.com/tokio-rs/axum/pull/574
 
 # 0.3.3 (13. November, 2021)
 

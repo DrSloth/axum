@@ -1,5 +1,4 @@
 [package]
-authors = ["Programatik <programatik29@gmail.com>"]
 categories = ["development-tools::debugging"]
 description = "Better error messages for axum framework."
 edition = "2018"
@@ -9,7 +8,7 @@ license = "MIT"
 name = "axum-debug"
 readme = "README.md"
 repository = "https://github.com/tokio-rs/axum"
-version = "0.1.0"
+version = "0.2.2"
 
 [lib]
 proc-macro = true
@@ -22,3 +21,4 @@ syn = { version = "1.0", features = ["full"] }
 [dev-dependencies]
 axum = { path = "../axum", version = "0.3" }
 trybuild = "1.0"
+rustversion = "1.0"

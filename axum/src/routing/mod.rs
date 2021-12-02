@@ -2,12 +2,13 @@
 
 use self::{future::RouterFuture, not_found::NotFound};
 use crate::{
-    body::{box_body, Body, BoxBody},
+    body::{boxed, Body, BoxBody},
     extract::{
         connect_info::{Connected, IntoMakeServiceWithConnectInfo},
         MatchedPath, OriginalUri,
     },
-    util::{ByteStr, PercentDecodedByteStr},
+    routing::strip_prefix::StripPrefix,
+    util::{try_downcast, ByteStr, PercentDecodedByteStr},
     BoxError,
 };
 use bytes::Bytes;
@@ -20,18 +21,16 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tower::{util::ServiceExt, ServiceBuilder};
+use tower::{layer::layer_fn, ServiceBuilder};
 use tower_http::map_response_body::MapResponseBodyLayer;
 use tower_layer::Layer;
 use tower_service::Service;
 
 pub mod future;
-pub mod handler_method_routing;
-pub mod service_method_routing;
 
 mod into_make_service;
 mod method_filter;
-mod method_not_allowed;
+mod method_routing;
 mod not_found;
 mod route;
 mod strip_prefix;
@@ -39,14 +38,12 @@ mod strip_prefix;
 #[cfg(test)]
 mod tests;
 
-pub use self::{
-    into_make_service::IntoMakeService, method_filter::MethodFilter,
-    method_not_allowed::MethodNotAllowed, route::Route,
-};
+pub use self::{into_make_service::IntoMakeService, method_filter::MethodFilter, route::Route};
 
-#[doc(no_inline)]
-pub use self::handler_method_routing::{
-    any, delete, get, head, on, options, patch, post, put, trace, MethodRouter,
+pub use self::method_routing::{
+    any, any_service, delete, delete_service, get, get_service, head, head_service, on, on_service,
+    options, options_service, patch, patch_service, post, post_service, put, put_service, trace,
+    trace_service, MethodRouter,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,7 +60,7 @@ impl RouteId {
 /// The router type for composing handlers and services.
 #[derive(Debug)]
 pub struct Router<B = Body> {
-    routes: HashMap<RouteId, Route<B>>,
+    routes: HashMap<RouteId, Endpoint<B>>,
     node: Node,
     fallback: Fallback<B>,
     nested_at_root: bool,
@@ -131,11 +128,32 @@ where
 
         let id = RouteId::next();
 
+        let service = match try_downcast::<MethodRouter<B, Infallible>, _>(service) {
+            Ok(method_router) => {
+                if let Some((route_id, Endpoint::MethodRouter(prev_method_router))) = self
+                    .node
+                    .path_to_route_id
+                    .get(path)
+                    .and_then(|route_id| self.routes.get(route_id).map(|svc| (*route_id, svc)))
+                {
+                    // if we're adding a new `MethodRouter` to a route that already has one just
+                    // merge them. This makes `.route("/", get(_)).route("/", post(_))` work
+                    let service =
+                        Endpoint::MethodRouter(prev_method_router.clone().merge(method_router));
+                    self.routes.insert(route_id, service);
+                    return self;
+                } else {
+                    Endpoint::MethodRouter(method_router)
+                }
+            }
+            Err(service) => Endpoint::Route(Route::new(service)),
+        };
+
         if let Err(err) = self.node.insert(path, id) {
             self.panic_on_matchit_error(err);
         }
 
-        self.routes.insert(id, Route::new(service));
+        self.routes.insert(id, service);
 
         self
     }
@@ -171,22 +189,33 @@ where
                 let Router {
                     mut routes,
                     node,
-                    // discard the fallback of the nested router
-                    fallback: _,
+                    fallback,
                     // nesting a router that has something nested at root
                     // doesn't mean something is nested at root in _this_ router
                     // thus we don't need to propagate that
                     nested_at_root: _,
                 } = router;
 
-                for (id, nested_path) in node.paths {
+                if let Fallback::Custom(_) = fallback {
+                    panic!("Cannot nest `Router`s that has a fallback");
+                }
+
+                for (id, nested_path) in node.route_id_to_path {
                     let route = routes.remove(&id).unwrap();
                     let full_path = if &*nested_path == "/" {
-                        path.to_string()
+                        path.to_owned()
                     } else {
                         format!("{}{}", path, nested_path)
                     };
-                    self = self.route(&full_path, strip_prefix::StripPrefix::new(route, prefix));
+                    self = match route {
+                        Endpoint::MethodRouter(method_router) => self.route(
+                            &full_path,
+                            method_router.layer(layer_fn(|s| StripPrefix::new(s, prefix))),
+                        ),
+                        Endpoint::Route(route) => {
+                            self.route(&full_path, StripPrefix::new(route, prefix))
+                        }
+                    };
                 }
 
                 debug_assert!(routes.is_empty());
@@ -215,19 +244,24 @@ where
             nested_at_root,
         } = other;
 
-        if let Err(err) = self.node.merge(node) {
-            self.panic_on_matchit_error(err);
-        }
-
         for (id, route) in routes {
-            assert!(self.routes.insert(id, route).is_none());
+            let path = node
+                .route_id_to_path
+                .get(&id)
+                .expect("no path for route id. This is a bug in axum. Please file an issue");
+            self = match route {
+                Endpoint::MethodRouter(route) => self.route(path, route),
+                Endpoint::Route(route) => self.route(path, route),
+            };
         }
 
         self.fallback = match (self.fallback, fallback) {
             (Fallback::Default(_), pick @ Fallback::Default(_)) => pick,
             (Fallback::Default(_), pick @ Fallback::Custom(_)) => pick,
             (pick @ Fallback::Custom(_), Fallback::Default(_)) => pick,
-            (Fallback::Custom(_), pick @ Fallback::Custom(_)) => pick,
+            (Fallback::Custom(_), Fallback::Custom(_)) => {
+                panic!("Cannot merge two `Router`s that both have a fallback")
+            }
         };
 
         self.nested_at_root = self.nested_at_root || nested_at_root;
@@ -248,20 +282,25 @@ where
         NewResBody::Error: Into<BoxError>,
     {
         let layer = ServiceBuilder::new()
-            .layer_fn(Route::new)
-            .layer(MapResponseBodyLayer::new(box_body))
-            .layer(layer);
+            .layer(MapResponseBodyLayer::new(boxed))
+            .layer(layer)
+            .into_inner();
 
         let routes = self
             .routes
             .into_iter()
             .map(|(id, route)| {
-                let route = Layer::layer(&layer, route);
+                let route = match route {
+                    Endpoint::MethodRouter(method_router) => {
+                        Endpoint::MethodRouter(method_router.layer(&layer))
+                    }
+                    Endpoint::Route(route) => Endpoint::Route(Route::new(layer.layer(route))),
+                };
                 (id, route)
             })
             .collect();
 
-        let fallback = self.fallback.map(|svc| Layer::layer(&layer, svc));
+        let fallback = self.fallback.map(|svc| Route::new(layer.layer(svc)));
 
         Router {
             routes,
@@ -284,15 +323,20 @@ where
         NewResBody::Error: Into<BoxError>,
     {
         let layer = ServiceBuilder::new()
-            .layer_fn(Route::new)
-            .layer(MapResponseBodyLayer::new(box_body))
-            .layer(layer);
+            .layer(MapResponseBodyLayer::new(boxed))
+            .layer(layer)
+            .into_inner();
 
         let routes = self
             .routes
             .into_iter()
             .map(|(id, route)| {
-                let route = Layer::layer(&layer, route);
+                let route = match route {
+                    Endpoint::MethodRouter(method_router) => {
+                        Endpoint::MethodRouter(method_router.layer(&layer))
+                    }
+                    Endpoint::Route(route) => Endpoint::Route(Route::new(layer.layer(route))),
+                };
                 (id, route)
             })
             .collect();
@@ -360,7 +404,7 @@ where
         let id = *match_.value;
         req.extensions_mut().insert(id);
 
-        if let Some(matched_path) = self.node.paths.get(&id) {
+        if let Some(matched_path) = self.node.route_id_to_path.get(&id) {
             let matched_path = if let Some(previous) = req.extensions_mut().get::<MatchedPath>() {
                 // a previous `MatchedPath` might exist if we're inside a nested Router
                 let previous = if let Some(previous) =
@@ -383,18 +427,22 @@ where
             .params
             .iter()
             .filter(|(key, _)| !key.starts_with(NEST_TAIL_PARAM))
-            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<Vec<_>>();
 
         insert_url_params(&mut req, params);
 
-        let route = self
+        let mut route = self
             .routes
             .get(&id)
             .expect("no route for id. This is a bug in axum. Please file an issue")
             .clone();
 
-        RouterFuture::from_oneshot(route.oneshot(req))
+        let future = match &mut route {
+            Endpoint::MethodRouter(inner) => inner.call(req),
+            Endpoint::Route(inner) => inner.call(req),
+        };
+        RouterFuture::from_future(future)
     }
 
     fn panic_on_matchit_error(&self, err: matchit::InsertError) {
@@ -429,7 +477,7 @@ where
             req.extensions_mut().insert(original_uri);
         }
 
-        let path = req.uri().path().to_string();
+        let path = req.uri().path().to_owned();
 
         match self.node.at(&path) {
             Ok(match_) => self.call_route(match_, req),
@@ -449,10 +497,10 @@ where
                 } else {
                     match &self.fallback {
                         Fallback::Default(inner) => {
-                            RouterFuture::from_oneshot(inner.clone().oneshot(req))
+                            RouterFuture::from_future(inner.clone().call(req))
                         }
                         Fallback::Custom(inner) => {
-                            RouterFuture::from_oneshot(inner.clone().oneshot(req))
+                            RouterFuture::from_future(inner.clone().call(req))
                         }
                     }
                 }
@@ -537,7 +585,8 @@ pub(crate) struct InvalidUtf8InPathParam {
 #[derive(Clone, Default)]
 struct Node {
     inner: matchit::Node<RouteId>,
-    paths: HashMap<RouteId, Arc<str>>,
+    route_id_to_path: HashMap<RouteId, Arc<str>>,
+    path_to_route_id: HashMap<Arc<str>, RouteId>,
 }
 
 impl Node {
@@ -547,15 +596,13 @@ impl Node {
         val: RouteId,
     ) -> Result<(), matchit::InsertError> {
         let path = path.into();
-        self.inner.insert(&path, val)?;
-        self.paths.insert(val, path.into());
-        Ok(())
-    }
 
-    fn merge(&mut self, other: Node) -> Result<(), matchit::InsertError> {
-        for (id, path) in other.paths {
-            self.insert(&*path, id)?;
-        }
+        self.inner.insert(&path, val)?;
+
+        let shared_path: Arc<str> = path.into();
+        self.route_id_to_path.insert(val, shared_path.clone());
+        self.path_to_route_id.insert(shared_path, val);
+
         Ok(())
     }
 
@@ -569,16 +616,18 @@ impl Node {
 
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Node").field("paths", &self.paths).finish()
+        f.debug_struct("Node")
+            .field("paths", &self.route_id_to_path)
+            .finish()
     }
 }
 
-enum Fallback<B> {
-    Default(Route<B>),
-    Custom(Route<B>),
+enum Fallback<B, E = Infallible> {
+    Default(Route<B, E>),
+    Custom(Route<B, E>),
 }
 
-impl<B> Clone for Fallback<B> {
+impl<B, E> Clone for Fallback<B, E> {
     fn clone(&self) -> Self {
         match self {
             Fallback::Default(inner) => Fallback::Default(inner.clone()),
@@ -587,7 +636,7 @@ impl<B> Clone for Fallback<B> {
     }
 }
 
-impl<B> fmt::Debug for Fallback<B> {
+impl<B, E> fmt::Debug for Fallback<B, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default(inner) => f.debug_tuple("Default").field(inner).finish(),
@@ -596,10 +645,10 @@ impl<B> fmt::Debug for Fallback<B> {
     }
 }
 
-impl<B> Fallback<B> {
-    fn map<F, B2>(self, f: F) -> Fallback<B2>
+impl<B, E> Fallback<B, E> {
+    fn map<F, B2, E2>(self, f: F) -> Fallback<B2, E2>
     where
-        F: FnOnce(Route<B>) -> Route<B2>,
+        F: FnOnce(Route<B, E>) -> Route<B2, E2>,
     {
         match self {
             Fallback::Default(inner) => Fallback::Default(f(inner)),
@@ -608,17 +657,26 @@ impl<B> Fallback<B> {
     }
 }
 
-fn try_downcast<T, K>(k: K) -> Result<T, K>
-where
-    T: 'static,
-    K: Send + 'static,
-{
-    use std::any::Any;
+enum Endpoint<B> {
+    MethodRouter(MethodRouter<B>),
+    Route(Route<B>),
+}
 
-    let k = Box::new(k) as Box<dyn Any + Send + 'static>;
-    match k.downcast() {
-        Ok(t) => Ok(*t),
-        Err(other) => Err(*other.downcast().unwrap()),
+impl<B> Clone for Endpoint<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Endpoint::MethodRouter(inner) => Endpoint::MethodRouter(inner.clone()),
+            Endpoint::Route(inner) => Endpoint::Route(inner.clone()),
+        }
+    }
+}
+
+impl<B> fmt::Debug for Endpoint<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MethodRouter(inner) => inner.fmt(f),
+            Self::Route(inner) => inner.fmt(f),
+        }
     }
 }
 

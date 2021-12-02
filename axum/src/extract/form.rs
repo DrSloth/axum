@@ -1,7 +1,6 @@
-use super::{has_content_type, rejection::*, take_body, FromRequest, RequestParts};
+use super::{has_content_type, rejection::*, FromRequest, RequestParts};
 use crate::BoxError;
 use async_trait::async_trait;
-use bytes::Buf;
 use http::Method;
 use serde::de::DeserializeOwned;
 use std::ops::Deref;
@@ -60,15 +59,12 @@ where
                 .map_err(FailedToDeserializeQueryString::new::<T, _>)?;
             Ok(Form(value))
         } else {
-            if !has_content_type(req, "application/x-www-form-urlencoded")? {
+            if !has_content_type(req, &mime::APPLICATION_WWW_FORM_URLENCODED)? {
                 return Err(InvalidFormContentType.into());
             }
 
-            let body = take_body(req)?;
-            let chunks = hyper::body::aggregate(body)
-                .await
-                .map_err(FailedToBufferBody::from_err)?;
-            let value = serde_urlencoded::from_reader(chunks.reader())
+            let bytes = bytes::Bytes::from_request(req).await?;
+            let value = serde_urlencoded::from_bytes(&bytes)
                 .map_err(FailedToDeserializeQueryString::new::<T, _>)?;
 
             Ok(Form(value))
@@ -115,7 +111,7 @@ mod tests {
                 .method(Method::POST)
                 .header(
                     http::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
+                    mime::APPLICATION_WWW_FORM_URLENCODED.as_ref(),
                 )
                 .body(http_body::Full::<bytes::Bytes>::new(
                     serde_urlencoded::to_string(&value).unwrap().into(),
@@ -182,7 +178,7 @@ mod tests {
             Request::builder()
                 .uri("http://example.com/test")
                 .method(Method::POST)
-                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
                 .body(http_body::Full::<bytes::Bytes>::new(
                     serde_urlencoded::to_string(&Pagination {
                         size: Some(10),
